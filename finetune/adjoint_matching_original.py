@@ -118,32 +118,54 @@ class Interpolant:
         return self.d_alpha(t) * x_1 + self.d_sigma(t) * x_0
 
 
+
+
 # ==============================================================================
 # Memoryless Schedule (required for SOC formulation)
 # ==============================================================================
 class MemorylessSchedule:
     """
-    Memoryless noise schedule for Adjoint Matching.
-    
-    From the AM paper (Prop. 1): DDIM with η ≥ 1 is memoryless.
-    η = 1 gives the distinguished memoryless schedule.
-    
-    For flow matching, we need to add diffusion to get an SDE.
+    Memoryless AM schedule derived from the interpolant (alpha, beta).
+
+    beta(t) here is Interpolant.sigma(t).
     """
-    
-    def __init__(self, eta: float = 1.0):
+    def __init__(self, interpolant: Interpolant, t_min: float = 1e-4, eps: float = 1e-12):
+        self.interpolant = interpolant
+        self.t_min = t_min
+        self.eps = eps
+
+    def clamp_t(self, t: torch.Tensor) -> torch.Tensor:
+        return t.clamp(min=self.t_min, max=1.0)
+
+    def kappa(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            eta: DDIM η parameter, must be >= 1 for memoryless property
+        kappa(t) = dot(alpha)/alpha
         """
-        if eta < 1.0:
-            raise ValueError(f"eta must be >= 1.0 for memoryless schedule, got {eta}")
-        self.eta = eta
-    
-    def get_sigma(self, t: torch.Tensor) -> torch.Tensor:
-        """Get diffusion coefficient at time t."""
-        # For flow matching with linear path: σ_sde(t) = η * (1 - t)
-        return self.eta * (1 - t)
+        t = self.clamp_t(t)
+        a = self.interpolant.alpha(t).clamp(min=self.eps)
+        da = self.interpolant.d_alpha(t)
+        return da / a
+
+    def eta_am(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        eta_AM(t) = beta(t) * ( kappa(t)*beta(t) - dot(beta)(t) )
+        where beta(t) is Interpolant.sigma(t) in your naming.
+        """
+        t = self.clamp_t(t)
+        beta = self.interpolant.sigma(t)
+        dbeta = self.interpolant.d_sigma(t)
+        kap = self.kappa(t)
+        eta = beta * (kap * beta - dbeta)
+        # numerical safety
+        return eta.clamp(min=self.eps)
+
+    def sigma_ft(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Memoryless diffusion schedule for AM fine-tuning:
+        sigma_ft(t)^2 = 2 * eta_AM(t)
+        """
+        return torch.sqrt(2.0 * self.eta_am(t))
+
 
 
 # ==============================================================================
@@ -322,10 +344,21 @@ class AdjointMatchingLoss(nn.Module):
         # Control: u_θ = v_θ - v_base
         control = v_model - v_base
         
+        '''
         # Optimal control: u* = σ(t)² · λ · adjoint
         t_expanded = expand_t_like_x(t, x_t)
         sigma_t = self.schedule.get_sigma(t_expanded)
         optimal_control = (sigma_t ** 2) * self.reward_scale * adjoint
+        '''
+
+        # eta_AM(t) is [B] (or broadcast); build it from schedule + interpolant
+        t_eta = t  # here t is [B] already in your call
+        eta_t = self.schedule.eta_am(t_eta)               # [B]
+        eta_x = expand_t_like_x(eta_t, x_t)
+
+        # velocity-space target for memoryless AM:
+        #   v_model - v_base  ≈  lambda * eta_AM(t) * adjoint
+        optimal_control = self.reward_scale * eta_x * adjoint
         
         # MSE loss
         loss = torch.mean((control - optimal_control) ** 2)
@@ -360,6 +393,49 @@ class AdjointMatchingTrainer:
             loss_dict['loss'].backward()
             optimizer.step()
     """
+
+    def am_memoryless_step(
+        self,
+        x: torch.Tensor,
+        v: torch.Tensor,
+        t: torch.Tensor,
+        dt: float,
+        schedule: MemorylessSchedule,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        One Euler–Maruyama step for memoryless AM fine-tuning SDE:
+
+            dx = (2*v(x,t) - kappa(t)*x) dt + sigma_ft(t) dB_t
+
+        where sigma_ft(t) = sqrt(2*eta_AM(t)).
+
+        Args:
+            x: current state [B,C,H,W]
+            v: velocity model output v(x,t) [B,C,H,W]
+            t: time tensor [B] or scalar tensor
+            dt: float step size
+            schedule: MemorylessSchedule (AM-consistent)
+            noise: optional noise tensor same shape as x
+        """
+        if noise is None:
+            noise = torch.randn_like(x)
+
+        # Make t broadcastable to x
+        if t.dim() == 0:
+            t_batch = t.expand(x.shape[0])
+        else:
+            t_batch = t
+
+        kap = schedule.kappa(t_batch)             # [B]
+        sig = schedule.sigma_ft(t_batch)          # [B]
+
+        kap_x = expand_t_like_x(kap, x)           # [B,1,1,1] -> [B,C,H,W]
+        sig_x = expand_t_like_x(sig, x)
+
+        drift = 2.0 * v - kap_x * x
+        x_next = x + dt * drift + (dt ** 0.5) * sig_x * noise
+        return x_next
     
     def __init__(
         self,
@@ -370,6 +446,7 @@ class AdjointMatchingTrainer:
         reward_scale: float = 10.0,
         cfg_scale: float = 4.0,
         num_sampling_steps: int = 50,
+        sigma: int = 1.0,
         eta: float = 1.0,
         device: str = 'cuda'
     ):
@@ -399,7 +476,7 @@ class AdjointMatchingTrainer:
         
         # Setup interpolant and schedule
         self.interpolant = Interpolant(path_type)
-        self.schedule = MemorylessSchedule(eta=eta)
+        self.schedule = MemorylessSchedule(interpolant=self.interpolant, t_min=1e-4)
         
         # Loss function
         self.loss_fn = AdjointMatchingLoss(
@@ -407,6 +484,7 @@ class AdjointMatchingTrainer:
             schedule=self.schedule,
             reward_scale=reward_scale
         )
+    
     
     @torch.no_grad()
     def generate_trajectory(
@@ -452,9 +530,18 @@ class AdjointMatchingTrainer:
             else:
                 v = self.base_model(x, t_batch, y)
             
-            # Euler step
-            x = x + dt * v
-            trajectory[i + 1] = x
+            # Euler–Maruyama SDE step
+            t_scalar = t  # scalar tensor
+
+            x = self.am_memoryless_step(
+                x=x,
+                v=v,
+                t=t_batch,             # pass batch time (or scalar is fine)
+                dt=dt,
+                schedule=self.schedule,
+                noise=None
+            )
+            trajectory[i + 1].copy_(x)
         
         return trajectory, times
     
@@ -478,19 +565,63 @@ class AdjointMatchingTrainer:
                 v = v_uncond + self.cfg_scale * (v_cond - v_uncond)
             else:
                 v = self.model(x, t_batch, y)
-            x = x + dt * v
-            trajectory[i + 1] = x
+            
+            # Euler–Maruyama SDE step
+            t_scalar = t  # scalar tensor
+
+            x = self.am_memoryless_step(
+                x=x,
+                v=v,
+                t=t_batch,             # pass batch time (or scalar is fine)
+                dt=dt,
+                schedule=self.schedule,
+                noise=None
+            )
+            trajectory[i + 1].copy_(x)
 
         return trajectory, times
 
     
-    def compute_terminal_adjoint(self, x_T: torch.Tensor) -> torch.Tensor:
-    # inference_mode overrides enable_grad; must turn it off explicitly
+    def compute_terminal_adjoint(self, x_T: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute terminal adjoint: a(T) = ∇_x r(x_T)
+        
+        Args:
+            x_T: Final generated samples [B, C, H, W]
+            
+        Returns:
+            Terminal adjoint [B, C, H, W]
+        """
+
+        '''
+        x_T = x_T.detach().requires_grad_(True)
+        reward = self.reward_fn(x_T)  # [B]
+        
+        # Sum rewards and backprop
+        total_reward = reward.sum()
+        terminal_adjoint = torch.autograd.grad(
+            total_reward, x_T, create_graph=False
+        )[0]
+
+        # test = torch.randn_like(x_T)
+        # r_test = self.reward_fn(test)
+        # print("r_test:", r_test.mean().item(), r_test.min().item(), r_test.max().item())
+
+        # print("aT stats:",
+            # terminal_adjoint.mean().item(),
+            # terminal_adjoint.abs().max().item(),
+            # terminal_adjoint.flatten(1).norm(dim=1).mean().item())
+        
+        return terminal_adjoint.detach()
+        '''
+        # Always make a leaf for terminal gradient
         with torch.inference_mode(False):
             with torch.enable_grad():
                 x = x_T.detach().requires_grad_(True)
-                r = self.reward_fn(x)          # [B]
-                assert r.requires_grad, f"reward has no grad_fn (grad_enabled={torch.is_grad_enabled()})"
+                try:
+                    r = self.reward_fn(x, class_labels=y)  # <-- keyword
+                except TypeError:
+                    r = self.reward_fn(x)                  # for rewards that don't accept it
                 (g,) = torch.autograd.grad(r.sum(), x, create_graph=False, retain_graph=False)
         return g.detach()
 
@@ -502,7 +633,7 @@ class AdjointMatchingTrainer:
         batch_size: int,
         latent_size: int = 32,
         num_classes: int = 398,
-        return_intermediates: bool = True
+        return_intermediates: bool = True  # ADD THIS
     ) -> Dict[str, torch.Tensor]:
         """
         Complete training step.
@@ -526,13 +657,13 @@ class AdjointMatchingTrainer:
         
         # 3. Compute terminal adjoint: ∇r(x_T)
         x_T = trajectory[-1]
-        terminal_adjoint = self.compute_terminal_adjoint(x_T)
+        terminal_adjoint = self.compute_terminal_adjoint(x_T, y=y)
 
         # --- reward stats under *current* model ---
         with torch.no_grad():
             traj_model, _ = self.generate_trajectory_with_model(z_0, y)
             x_T_model = traj_model[-1]
-            rewards = self.reward_fn(x_T_model)
+            rewards = self.reward_fn(x_T_model, class_labels=y)
             reward_mean = rewards.mean()
             reward_std = rewards.std(unbiased=False)
         
@@ -571,13 +702,35 @@ class AdjointMatchingTrainer:
         loss_dict["reward_mean"] = reward_mean.detach()
         loss_dict["reward_std"] = reward_std.detach()
 
-        # NEW: Return intermediates if requested
         if return_intermediates:
             loss_dict["trajectory"] = trajectory.detach()
             loss_dict["adjoint_traj"] = adjoint_traj.detach()
             loss_dict["times"] = times.detach()
             loss_dict["y"] = y.detach()
-               
+
+        '''
+        # pick one step/time
+        x = trajectory[-1].detach().requires_grad_(True)
+        t_batch = times[-1].expand(x.shape[0])
+        a = terminal_adjoint.detach()
+
+        # build v the same way your compute_lean_adjoint does (CFG or not)
+        v = self.base_model(x, t_batch, y)  # or CFG-composed v
+
+        vjp_autograd = torch.autograd.grad((v * a).sum(), x, create_graph=False)[0]  # J^T a
+        vjp_lean = compute_lean_adjoint(self.base_model, x.detach(), t_batch, y, a, self.cfg_scale)
+
+        print("max|lean - autograd|:", (vjp_lean - vjp_autograd).abs().max().item())
+        print("max|lean + autograd|:", (vjp_lean + vjp_autograd).abs().max().item())
+        '''
+
+        # adj_base  = solve_adjoint_ode(self.base_model, trajectory, times, y, terminal_adjoint, cfg_scale=self.cfg_scale)
+        # adj_model = solve_adjoint_ode(self.model,      trajectory, times, y, terminal_adjoint, cfg_scale=self.cfg_scale)
+
+        # t_idx = torch.randint(1, self.num_sampling_steps, (1,)).item()
+        # err = (adj_base[t_idx] - adj_model[t_idx]).abs().max().item()
+        # print("max |adj_base - adj_model| at t_idx:", err)     
+
         return loss_dict
 
 

@@ -29,6 +29,7 @@ from download import find_model
 from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
 from train_utils import parse_transport_args
+from tqdm.auto import tqdm
 import wandb_utils
 
 
@@ -239,6 +240,15 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+
+        # steps per epoch = floor(len(dataset)/(global_batch_size))
+        # drop_last=True in your DataLoader, so floor is correct.
+        world_size = dist.get_world_size()
+        steps_per_epoch = len(dataset) // ( (args.global_batch_size // world_size) * world_size )
+
+        use_bar = (dist.get_rank() == 0) and (not args.no_tqdm)
+        pbar = tqdm(total=steps_per_epoch, desc=f"epoch {epoch}", leave=False) if use_bar else None
+
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
@@ -257,6 +267,11 @@ def main(args):
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
+
+            # advance bar by one step
+            if pbar is not None:
+                pbar.update(1)
+
             if train_steps % args.log_every == 0:
                 # Measure training speed:
                 torch.cuda.synchronize()
@@ -306,6 +321,9 @@ def main(args):
                     wandb_utils.log_image(out_samples, train_steps)
                 logging.info("Generating EMA samples done.")
 
+        if pbar is not None:
+            pbar.close()
+
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -322,7 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--global-batch-size", type=int, default=224)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
@@ -330,6 +348,8 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--no-tqdm", action="store_true", default=False,
+                    help="Disable tqdm progress bar on rank 0.")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")

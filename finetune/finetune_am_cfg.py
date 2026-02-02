@@ -1,25 +1,3 @@
-"""
-Fine-tune SiT with Adjoint Matching (Multi-GPU DDP)
-====================================================
-
-Distributed training with PyTorch DDP, matching SiT's train.py style.
-
-Usage:
-    # Single node, 7 GPUs
-    torchrun --nnodes=1 --nproc_per_node=7 finetune/finetune_am_ddp.py \
-        --ckpt /path/to/SiT-XL-2-256.pt \
-        --reward aesthetic \
-        --num-iterations 5000 \
-        --batch-size 4
-
-    # Multi-node (example: 2 nodes, 8 GPUs each)
-    torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
-        --master_addr=<master_ip> --master_port=29500 \
-        finetune/finetune_am_ddp.py --ckpt ... 
-
-This script should be run from the SiT root directory.
-"""
-
 import argparse
 import os
 import sys
@@ -106,7 +84,7 @@ def parse_args():
     
     # Fine-tuning method
     parser.add_argument("--method", type=str, default="full",
-                        choices=["full", "lora", "control_net", "stochastic", "original"],
+                        choices=["full", "lora", "control_net", "stochastic"],
                         help="Fine-tuning method")
     parser.add_argument("--lora-rank", type=int, default=16,
                         help="LoRA rank (only for --method lora)")
@@ -161,6 +139,12 @@ def parse_args():
     parser.add_argument("--log-images-every", type=int, default=1)
     parser.add_argument("--num-images-to-log", type=int, default=4)
     parser.add_argument("--log-intermediates-every", type=int, default=1)
+    parser.add_argument("--eval-every", type=int, default=100,
+                        help="Compute eval_reward every N iterations")
+    parser.add_argument("--num-eval-images", type=int, default=16,
+                        help="Number of images for eval_reward computation")
+    parser.add_argument("--eval-cfg-scale", type=float, default=4.5,
+                        help="CFG scale for eval sampling")
     
     return parser.parse_args()
 
@@ -228,21 +212,6 @@ def setup_finetuning_method(model, base_model, args, device):
     elif args.method == "stochastic":
         # Full model fine-tuning
         from finetune.adjoint_matching_stochastic import AdjointMatchingTrainer
-        
-        # Wrap model with DDP
-        model = DDP(model, device_ids=[device], find_unused_parameters=False)
-        
-        trainable_params = list(model.parameters())
-        
-        trainer_class = AdjointMatchingTrainer
-        trainer_kwargs = {
-            'model': model,
-            'base_model': base_model,
-        }
-
-    elif args.method == "original":
-        # Full model fine-tuning
-        from finetune.adjoint_matching_original import AdjointMatchingTrainer
         
         # Wrap model with DDP
         model = DDP(model, device_ids=[device], find_unused_parameters=False)
@@ -484,6 +453,90 @@ def decode_and_log_images(trainer, vae, batch_size, latent_size, num_classes, nu
             print(f"  Logged {len(imgs_base)} comparison images")
 
 
+def compute_eval_reward_and_log_images(trainer, reward_fn, vae, latent_size, num_classes, 
+                                        num_images, step, device, eval_cfg_scale=4.5):
+    """
+    Compute eval_reward with deterministic sampling (eta=0) and specified CFG scale.
+    Also log the generated images.
+    
+    Args:
+        trainer: AdjointMatchingTrainer instance
+        reward_fn: Reward function to evaluate
+        vae: VAE decoder (can be None for latent-space rewards)
+        latent_size: Spatial size of latents
+        num_classes: Number of classes for conditioning
+        num_images: Number of images to generate for evaluation
+        step: Current training step
+        device: Device to generate on
+        eval_cfg_scale: CFG scale for evaluation (default 4.5)
+    
+    Returns:
+        eval_reward_mean: Mean reward across generated images
+        eval_reward_std: Std of reward across generated images
+    """
+    import wandb
+    import numpy as np
+    
+    z_0 = torch.randn(num_images, 4, latent_size, latent_size, device=device)
+    y = torch.randint(0, num_classes, (num_images,), device=device)
+    
+    # Store original settings
+    original_cfg_scale = trainer.cfg_scale
+    original_eta = trainer.eta
+    
+    # Set eval settings: deterministic sampling (eta=0) and specified CFG
+    trainer.cfg_scale = eval_cfg_scale
+    trainer.eta = 0.0  # Deterministic sampling
+    
+    with torch.no_grad():
+        # Generate with fine-tuned model using eval settings
+        traj_eval, _ = trainer.generate_trajectory_with_model(z_0, y)
+        x_T_eval = traj_eval[-1]
+        
+        # Compute reward on final latents
+        reward_values = reward_fn(x_T_eval)
+        eval_reward_mean = reward_values.mean().item()
+        eval_reward_std = reward_values.std().item()
+        
+        print(f"[Eval at step {step}]")
+        print(f"  eval_cfg_scale: {eval_cfg_scale}, eta: 0.0 (deterministic)")
+        print(f"  eval_reward_mean: {eval_reward_mean:.4f}, eval_reward_std: {eval_reward_std:.4f}")
+        print(f"  x_T_eval: min={x_T_eval.min():.3f}, max={x_T_eval.max():.3f}, mean={x_T_eval.mean():.3f}")
+        
+        # Log images
+        if vae is not None:
+            imgs_eval = vae.decode(x_T_eval / 0.18215).sample
+            imgs_eval = ((imgs_eval / 2 + 0.5).clamp(0, 1) * 255).byte()
+            imgs_eval = imgs_eval.cpu().permute(0, 2, 3, 1).numpy()
+            
+            eval_images = [
+                wandb.Image(img, caption=f"class={y[i].item()}, r={reward_values[i].item():.3f}") 
+                for i, img in enumerate(imgs_eval)
+            ]
+            
+            wandb.log({
+                "eval_samples_cfg4.5": eval_images,
+                "eval_reward_mean": eval_reward_mean,
+                "eval_reward_std": eval_reward_std,
+                "step": step
+            })
+            
+            print(f"  Logged {len(imgs_eval)} eval images (CFG {eval_cfg_scale})")
+        else:
+            # No VAE, just log the reward metrics
+            wandb.log({
+                "eval_reward_mean": eval_reward_mean,
+                "eval_reward_std": eval_reward_std,
+                "step": step
+            })
+    
+    # Restore original settings
+    trainer.cfg_scale = original_cfg_scale
+    trainer.eta = original_eta
+    
+    return eval_reward_mean, eval_reward_std
+
+
 def log_intermediates(loss_dict, step):
     """Log intermediate trajectory/adjoint stats to wandb."""
     import wandb
@@ -532,6 +585,7 @@ def main():
     print_rank0(f"Global batch size: {args.batch_size * world_size}")
     print_rank0(f"Method: {args.method}")
     print_rank0(f"Reward: {args.reward}, Scale: {args.reward_scale}")
+    print_rank0(f"Eval every: {args.eval_every} iters, CFG: {args.eval_cfg_scale}, Images: {args.num_eval_images}")
     
     # Create output directory
     if is_main_process():
@@ -690,12 +744,12 @@ def main():
                     if "reward_std" in loss_dict:
                         log_data["reward_std"] = float(loss_dict["reward_std"])
 
-                    # NEW: Log images
+                    # Log training images (with current cfg_scale)
                     if step % args.log_images_every == 0:
                         decode_and_log_images(trainer, vae, args.batch_size, latent_size, 
                                             args.num_classes, args.num_images_to_log, step, device)
                     
-                    # NEW: Log intermediates
+                    # Log intermediates
                     if step % args.log_intermediates_every == 0:
                         log_intermediates(loss_dict, step)    
 
@@ -703,6 +757,20 @@ def main():
             
             running_loss = 0.0
             log_steps = 0
+        
+        # Eval reward computation (deterministic sampling, CFG 4.5)
+        if step % args.eval_every == 0 and is_main_process() and args.wandb:
+            compute_eval_reward_and_log_images(
+                trainer=trainer,
+                reward_fn=reward_fn,
+                vae=vae,
+                latent_size=latent_size,
+                num_classes=args.num_classes,
+                num_images=args.num_eval_images,
+                step=step,
+                device=device,
+                eval_cfg_scale=args.eval_cfg_scale
+            )
         
         # Save checkpoint
         if step % args.save_every == 0:

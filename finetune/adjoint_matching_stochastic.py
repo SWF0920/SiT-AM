@@ -118,6 +118,8 @@ class Interpolant:
         return self.d_alpha(t) * x_1 + self.d_sigma(t) * x_0
 
 
+
+
 # ==============================================================================
 # Memoryless Schedule (required for SOC formulation)
 # ==============================================================================
@@ -143,7 +145,7 @@ class MemorylessSchedule:
     def get_sigma(self, t: torch.Tensor) -> torch.Tensor:
         """Get diffusion coefficient at time t."""
         # For flow matching with linear path: σ_sde(t) = η * (1 - t)
-        return self.eta * (1 - t)
+        return self.eta * (t)
 
 
 # ==============================================================================
@@ -370,6 +372,7 @@ class AdjointMatchingTrainer:
         reward_scale: float = 10.0,
         cfg_scale: float = 4.0,
         num_sampling_steps: int = 50,
+        sigma: int = 1.0,
         eta: float = 1.0,
         device: str = 'cuda'
     ):
@@ -452,9 +455,14 @@ class AdjointMatchingTrainer:
             else:
                 v = self.base_model(x, t_batch, y)
             
-            # Euler step
-            x = x + dt * v
-            trajectory[i + 1] = x
+            # Euler–Maruyama SDE step
+            t_scalar = t  # scalar tensor
+            sigma = self.schedule.get_sigma(t_scalar)          # shape []
+            noise = torch.randn_like(x)
+
+            # x = x + dt * v + (dt ** 0.5) * (self.loss_fn.reward_scale ** 0.5) * sigma * noise
+            x = x + dt * v + (dt ** 0.5) * (1.0 ** 0.5) * sigma * noise
+            trajectory[i + 1].copy_(x)
         
         return trajectory, times
     
@@ -478,19 +486,77 @@ class AdjointMatchingTrainer:
                 v = v_uncond + self.cfg_scale * (v_cond - v_uncond)
             else:
                 v = self.model(x, t_batch, y)
-            x = x + dt * v
-            trajectory[i + 1] = x
+            
+            # Euler–Maruyama SDE step
+            t_scalar = t  # scalar tensor
+            sigma = self.schedule.get_sigma(t_scalar)          # shape []
+            noise = torch.randn_like(x)
+            # x = x + dt * v + (dt ** 0.5) * (self.loss_fn.reward_scale ** 0.5) * sigma * noise
+            x = x + dt * v + (dt ** 0.5) * (1.0 ** 0.5) * sigma * noise
+            trajectory[i + 1].copy_(x)
 
         return trajectory, times
 
     
-    def compute_terminal_adjoint(self, x_T: torch.Tensor) -> torch.Tensor:
-    # inference_mode overrides enable_grad; must turn it off explicitly
+    def compute_terminal_adjoint(self, x_T: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute terminal adjoint: a(T) = ∇_x r(x_T)
+        
+        Args:
+            x_T: Final generated samples [B, C, H, W]
+            
+        Returns:
+            Terminal adjoint [B, C, H, W]
+        """
+
+        '''
+        x_T = x_T.detach().requires_grad_(True)
+        reward = self.reward_fn(x_T)  # [B]
+        
+        # Sum rewards and backprop
+        total_reward = reward.sum()
+        terminal_adjoint = torch.autograd.grad(
+            total_reward, x_T, create_graph=False
+        )[0]
+
+        # test = torch.randn_like(x_T)
+        # r_test = self.reward_fn(test)
+        # print("r_test:", r_test.mean().item(), r_test.min().item(), r_test.max().item())
+
+        # print("aT stats:",
+            # terminal_adjoint.mean().item(),
+            # terminal_adjoint.abs().max().item(),
+            # terminal_adjoint.flatten(1).norm(dim=1).mean().item())
+        
+        return terminal_adjoint.detach()
+        
+        # Always make a leaf for terminal gradient
         with torch.inference_mode(False):
             with torch.enable_grad():
                 x = x_T.detach().requires_grad_(True)
-                r = self.reward_fn(x)          # [B]
-                assert r.requires_grad, f"reward has no grad_fn (grad_enabled={torch.is_grad_enabled()})"
+
+                # --- ONLY for ImageReward (pixel-space reward) when x is latent ---
+                if getattr(self.reward_fn, "__class__", None).__name__ == "ImageRewardScorer" and x.dim() == 4 and x.shape[1] == 4:
+                    # decode latent -> pixel (differentiable wrt x)
+                    for p in self.vae.parameters():
+                        p.requires_grad_(False)
+                    img = self.vae.decode(x).sample          # diffusers-style
+                    img = (img / 2 + 0.5).clamp(0, 1)
+                    r = self.reward_fn(img, None)  # [B]
+                else:
+                    r = self.reward_fn(x)    # [B]
+
+                (g,) = torch.autograd.grad(r.sum(), x, create_graph=False, retain_graph=False)
+
+        return g.detach()
+        '''
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                x = x_T.detach().requires_grad_(True)
+                try:
+                    r = self.reward_fn(x, class_labels=y)  # <-- keyword
+                except TypeError:
+                    r = self.reward_fn(x)                  # for rewards that don't accept it
                 (g,) = torch.autograd.grad(r.sum(), x, create_graph=False, retain_graph=False)
         return g.detach()
 
@@ -502,7 +568,7 @@ class AdjointMatchingTrainer:
         batch_size: int,
         latent_size: int = 32,
         num_classes: int = 398,
-        return_intermediates: bool = True
+        return_intermediates: bool = True  # ADD THIS
     ) -> Dict[str, torch.Tensor]:
         """
         Complete training step.
@@ -526,13 +592,13 @@ class AdjointMatchingTrainer:
         
         # 3. Compute terminal adjoint: ∇r(x_T)
         x_T = trajectory[-1]
-        terminal_adjoint = self.compute_terminal_adjoint(x_T)
+        terminal_adjoint = self.compute_terminal_adjoint(x_T, y=y)
 
         # --- reward stats under *current* model ---
         with torch.no_grad():
             traj_model, _ = self.generate_trajectory_with_model(z_0, y)
             x_T_model = traj_model[-1]
-            rewards = self.reward_fn(x_T_model)
+            rewards = self.reward_fn(x_T_model, class_labels=y)
             reward_mean = rewards.mean()
             reward_std = rewards.std(unbiased=False)
         
@@ -571,13 +637,35 @@ class AdjointMatchingTrainer:
         loss_dict["reward_mean"] = reward_mean.detach()
         loss_dict["reward_std"] = reward_std.detach()
 
-        # NEW: Return intermediates if requested
         if return_intermediates:
             loss_dict["trajectory"] = trajectory.detach()
             loss_dict["adjoint_traj"] = adjoint_traj.detach()
             loss_dict["times"] = times.detach()
             loss_dict["y"] = y.detach()
-               
+
+        '''
+        # pick one step/time
+        x = trajectory[-1].detach().requires_grad_(True)
+        t_batch = times[-1].expand(x.shape[0])
+        a = terminal_adjoint.detach()
+
+        # build v the same way your compute_lean_adjoint does (CFG or not)
+        v = self.base_model(x, t_batch, y)  # or CFG-composed v
+
+        vjp_autograd = torch.autograd.grad((v * a).sum(), x, create_graph=False)[0]  # J^T a
+        vjp_lean = compute_lean_adjoint(self.base_model, x.detach(), t_batch, y, a, self.cfg_scale)
+
+        print("max|lean - autograd|:", (vjp_lean - vjp_autograd).abs().max().item())
+        print("max|lean + autograd|:", (vjp_lean + vjp_autograd).abs().max().item())
+        '''
+
+        # adj_base  = solve_adjoint_ode(self.base_model, trajectory, times, y, terminal_adjoint, cfg_scale=self.cfg_scale)
+        # adj_model = solve_adjoint_ode(self.model,      trajectory, times, y, terminal_adjoint, cfg_scale=self.cfg_scale)
+
+        # t_idx = torch.randint(1, self.num_sampling_steps, (1,)).item()
+        # err = (adj_base[t_idx] - adj_model[t_idx]).abs().max().item()
+        # print("max |adj_base - adj_model| at t_idx:", err)     
+
         return loss_dict
 
 
